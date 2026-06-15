@@ -207,12 +207,21 @@ class PPTBuilder:
         for shape in list(duplicated_slide.shapes):
             self._remove_shape(shape)
         for shape in source_slide.shapes:
-            duplicated_slide.shapes._spTree.insert_element_before(deepcopy(shape._element), "p:extLst")
+            cloned_element = deepcopy(shape._element)
+            self._detach_placeholder_metadata(cloned_element)
+            duplicated_slide.shapes._spTree.insert_element_before(cloned_element, "p:extLst")
         slide_id_list = presentation.slides._sldIdLst
         new_slide_id = slide_id_list[-1]
         del slide_id_list[-1]
         slide_id_list.insert(slide_index + 1, new_slide_id)
         return presentation.slides[slide_index + 1]
+
+    def _detach_placeholder_metadata(self, shape_element) -> None:
+        for node in list(shape_element.iter()):
+            if node.tag.endswith("}ph"):
+                parent = node.getparent()
+                if parent is not None:
+                    parent.remove(node)
 
     def _set_text(self, shape, content: str) -> None:
         text_frame = shape.text_frame

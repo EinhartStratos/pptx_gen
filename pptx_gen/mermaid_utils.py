@@ -7,6 +7,9 @@ _GROUP_RE = re.compile(r"^group\s+(?P<id>[A-Za-z_][A-Za-z0-9_-]*)\([^)]*\)\[(?P<
 _SERVICE_RE = re.compile(
     r"^service\s+(?P<id>[A-Za-z_][A-Za-z0-9_-]*)\([^)]*\)\[(?P<label>.+)\](?:\s+in\s+(?P<group>[A-Za-z_][A-Za-z0-9_-]*))?$"
 )
+_NAMESPACE_RE = re.compile(r"^namespace\s+(?P<id>[^\s\[{]+)(?:\[(?P<label>.+)\])?\s*\{$")
+_CLASS_RE = re.compile(r"^class\s+(?P<id>[^\s\[{]+)(?:\[(?P<label>.+)\])?$")
+_SAFE_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def normalize_mermaid_source(diagram_kind: str | None, mermaid_source: str | None) -> tuple[str, str]:
@@ -16,7 +19,10 @@ def normalize_mermaid_source(diagram_kind: str | None, mermaid_source: str | Non
 
     first_line = _first_non_empty_line(source)
     if first_line == "architecture-beta":
-        normalized = _convert_architecture_beta_to_class_diagram(source)
+        normalized = _sanitize_class_diagram(_convert_architecture_beta_to_class_diagram(source))
+        return _first_non_empty_line(normalized), normalized
+    if first_line == "classDiagram":
+        normalized = _sanitize_class_diagram(source)
         return _first_non_empty_line(normalized), normalized
 
     return first_line, source
@@ -87,6 +93,77 @@ def _convert_architecture_beta_to_class_diagram(source: str) -> str:
     return "\n".join(rendered_lines)
 
 
+def _sanitize_class_diagram(source: str) -> str:
+    logical_lines = _to_logical_lines(source)
+    if not logical_lines:
+        return 'classDiagram\n  class node_1["系统架构图"]'
+
+    id_map: dict[str, str] = {}
+    namespace_labels: dict[str, str] = {}
+    class_labels: dict[str, str] = {}
+    namespace_count = 1
+    class_count = 1
+
+    for line in logical_lines[1:]:
+        if line.startswith("namespace "):
+            match = _NAMESPACE_RE.match(line)
+            if not match:
+                continue
+            original_id = match.group("id")
+            label = _clean_label(match.group("label") or original_id)
+            if original_id not in id_map:
+                id_map[original_id] = original_id if _SAFE_ID_RE.fullmatch(original_id) else f"ns_{namespace_count}"
+                if not _SAFE_ID_RE.fullmatch(original_id):
+                    namespace_count += 1
+            namespace_labels[original_id] = label
+            continue
+
+        if line.startswith("class "):
+            match = _CLASS_RE.match(line)
+            if not match:
+                continue
+            original_id = match.group("id")
+            label = _clean_label(match.group("label") or original_id)
+            if original_id not in id_map:
+                id_map[original_id] = original_id if _SAFE_ID_RE.fullmatch(original_id) else f"node_{class_count}"
+                if not _SAFE_ID_RE.fullmatch(original_id):
+                    class_count += 1
+            class_labels[original_id] = label
+
+    rendered_lines: list[str] = []
+    for line in logical_lines:
+        if line == "classDiagram":
+            rendered_lines.append(line)
+            continue
+        if line.startswith("direction "):
+            rendered_lines.append(line)
+            continue
+        if line == "}":
+            rendered_lines.append(line)
+            continue
+        if line.startswith("namespace "):
+            match = _NAMESPACE_RE.match(line)
+            if not match:
+                continue
+            original_id = match.group("id")
+            rendered_lines.append(f'  namespace {id_map[original_id]}["{namespace_labels[original_id]}"] {{')
+            continue
+        if line.startswith("class "):
+            match = _CLASS_RE.match(line)
+            if not match:
+                continue
+            original_id = match.group("id")
+            rendered_lines.append(f'    class {id_map[original_id]}["{class_labels[original_id]}"]')
+            continue
+
+        normalized_line = line
+        for original_id, safe_id in sorted(id_map.items(), key=lambda item: len(item[0]), reverse=True):
+            normalized_line = normalized_line.replace(original_id, safe_id)
+        rendered_lines.append(normalized_line)
+
+    return "\n".join(rendered_lines)
+
+
 def _convert_edge_line(line: str, known_nodes: set[str]) -> str | None:
     arrow = _extract_arrow(line)
     if arrow is None:
@@ -151,13 +228,16 @@ def _to_logical_lines(source: str) -> list[str]:
 
 
 def _brackets_balanced(line: str) -> bool:
-    pairs = [("[", "]"), ("(", ")"), ("{", "}")]
+    pairs = [("[", "]"), ("(", ")")]
     return all(line.count(left) <= line.count(right) for left, right in pairs)
 
 
 def _clean_label(label: str) -> str:
     cleaned = label.replace("\\n", " ")
     cleaned = cleaned.replace("\n", " ")
+    cleaned = cleaned.strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'", "`"}:
+        cleaned = cleaned[1:-1]
     cleaned = cleaned.replace('"', "'")
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip()
