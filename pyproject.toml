@@ -1,0 +1,28 @@
+[project]
+name = "pptx-gen"
+version = "0.1.0"
+description = "PPT 模板解析、分页生成与自动组装工具"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "python-pptx==1.0.2",
+    "mmdc>=0.4.1",
+    "pydantic>=2.8,<3",
+    "python-dotenv>=1.0,<2",
+]
+
+[project.scripts]
+pptx-gen = "pptx_gen.cli:main"
+
+[dependency-groups]
+dev = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["pptx_gen*"]
+
+[tool.uv]
+index-url = "https://mirrors.ustc.edu.cn/pypi/simple"
