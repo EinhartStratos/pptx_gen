@@ -6,6 +6,7 @@ import urllib.error
 import urllib.request
 
 from pptx_gen.config import LLMConfig
+from pptx_gen.mermaid_utils import normalize_mermaid_source
 from pptx_gen.schemas import GeneratedElement, PageGenerationResult
 
 
@@ -47,8 +48,8 @@ class MockLLMClient(BaseLLMClient):
             elif element_type == "image":
                 if any(keyword in lowered_requirement for keyword in ["架构", "流程", "时序", "architecture", "flow", "sequence"]):
                     diagram_kind = element.get("diagram_kind") or "architecture"
-                    mermaid_syntax = self._mermaid_syntax(diagram_kind)
                     mermaid_source = self._mock_mermaid(diagram_kind)
+                    mermaid_syntax, mermaid_source = normalize_mermaid_source(diagram_kind, mermaid_source)
                     elements.append(
                         GeneratedElement(
                             id=element["id"],
@@ -77,14 +78,26 @@ class MockLLMClient(BaseLLMClient):
             return "sequenceDiagram"
         if diagram_kind == "flowchart":
             return "flowchart TD"
-        return "architecture-beta"
+        return "classDiagram"
 
     def _mock_mermaid(self, diagram_kind: str) -> str:
         if diagram_kind == "sequence":
             return "sequenceDiagram\nparticipant User\nparticipant System\nUser->>System: 提交请求\nSystem-->>User: 返回结果"
         if diagram_kind == "flowchart":
             return "flowchart TD\nA[输入需求] --> B[解析模板]\nB --> C[生成页面]\nC --> D[输出PPT]"
-        return "architecture-beta\ngroup app(cloud)[业务系统]\nservice api(server)[API服务] in app\nservice model(database)[模型服务] in app\napi:R --> L:model"
+        return (
+            "classDiagram\n"
+            "  direction LR\n"
+            '  namespace channel["访问渠道"] {\n'
+            '    class Browser["浏览器"]\n'
+            "  }\n"
+            '  namespace systems["业务系统"] {\n'
+            '    class PTMS_IMS["PTMS-IMS"]\n'
+            '    class ModelService["模型服务"]\n'
+            "  }\n"
+            "  Browser --> PTMS_IMS\n"
+            "  PTMS_IMS --> ModelService"
+        )
 
 
 class OpenAICompatibleLLMClient(BaseLLMClient):
@@ -142,12 +155,13 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
             if element.get("type") != "image" or element.get("image_source_type") != "mermaid":
                 continue
             mermaid_source = (element.get("mermaid_source") or "").strip()
-            mermaid_syntax = (element.get("mermaid_syntax") or "").strip()
             if not mermaid_source:
                 continue
-            first_line = next((line.strip() for line in mermaid_source.splitlines() if line.strip()), "")
-            if first_line and (not mermaid_syntax or "\n" in mermaid_syntax or mermaid_syntax == mermaid_source):
-                element["mermaid_syntax"] = first_line
+            mermaid_syntax, normalized_source = normalize_mermaid_source(element.get("diagram_kind"), mermaid_source)
+            if mermaid_syntax:
+                element["mermaid_syntax"] = mermaid_syntax
+            if normalized_source:
+                element["mermaid_source"] = normalized_source
         return PageGenerationResult.model_validate(payload)
 
 

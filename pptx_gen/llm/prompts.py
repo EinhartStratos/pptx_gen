@@ -42,6 +42,13 @@ def _build_model_rule_view(page_rule: dict) -> dict:
 
 def build_user_prompt(requirement_text: str, page_rule: dict) -> str:
     model_page_rule = _build_model_rule_view(page_rule)
+    mermaid_instruction = ""
+    if any(element.get("type") == "image" and element.get("diagram_kind") == "architecture" for element in page_rule.get("elements", [])):
+        mermaid_instruction = (
+            "10. 架构图页面优先输出 classDiagram，不要使用 architecture-beta。使用 namespace 表示系统或渠道分组，"
+            "使用带标签的 class 表示组件名称，组件名称放在框内；连线可使用 --> 或 --。"
+            "请使用 ASCII 标识符加中文标签，例如 namespace sysA[\"渠道系统\"]、class compA[\"PTMS-IMS\"]。\n"
+        )
     output_schema = {
         "page_no": page_rule["page_no"],
         "should_generate": True,
@@ -63,8 +70,8 @@ def build_user_prompt(requirement_text: str, page_rule: dict) -> str:
                 "type": "image",
                 "image_source_type": "mermaid",
                 "diagram_kind": "architecture",
-                "mermaid_syntax": "architecture-beta",
-                "mermaid_source": "architecture-beta\n...",
+                "mermaid_syntax": "classDiagram",
+                "mermaid_source": "classDiagram\n  direction LR\n  namespace sysA[\"渠道系统\"] {\n    class compA[\"PTMS-IMS\"]\n  }",
             },
         ],
     }
@@ -79,7 +86,8 @@ def build_user_prompt(requirement_text: str, page_rule: dict) -> str:
         "6. 如果页面包含图片区，且适合图形表达，输出 Mermaid。\n"
         "7. 所有元素 id 必须严格复用模板规则里的 id。\n"
         "8. 不需要返回没有生成内容的元素。\n"
-        "9. 只输出 JSON。\n\n"
+        "9. 只输出 JSON。\n"
+        f"{mermaid_instruction}\n"
         f"需求全文：\n{requirement_text}\n\n"
         f"单页模板规则：\n{json.dumps(model_page_rule, ensure_ascii=False, indent=2)}\n\n"
         f"输出 JSON 结构示例：\n{json.dumps(output_schema, ensure_ascii=False, indent=2)}"

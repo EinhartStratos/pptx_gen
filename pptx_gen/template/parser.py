@@ -178,6 +178,12 @@ class TemplateRuleParser:
         name = c_nv_pr.attrib.get("name", f"image_{shape_id}")
         bbox = self._parse_bbox(xfrm)
         diagram_kind = self._infer_diagram_kind(name)
+        content_requirement = f"若当前页适合图形表达，请输出 {diagram_kind} 类型的 Mermaid 语法并用于渲染图片。"
+        if diagram_kind == "architecture":
+            content_requirement = (
+                "若当前页适合图形表达，请优先输出 classDiagram。使用 namespace 表示系统或渠道分组，"
+                "使用带标签的 class 表示组件名称，组件名称放在框内；连线可使用 --> 或 --，不要使用 architecture-beta。"
+            )
         return ElementRule(
             id=f"image_{shape_id}",
             shape_id=shape_id,
@@ -189,7 +195,7 @@ class TemplateRuleParser:
             editable=True,
             default_text=None,
             style=None,
-            content_requirement=f"若当前页适合图形表达，请输出 {diagram_kind} 类型的 Mermaid 语法并用于渲染图片。",
+            content_requirement=content_requirement,
             fill_strategy="render_mermaid_to_image",
             diagram_kind=diagram_kind,
         )

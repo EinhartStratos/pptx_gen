@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 
+from pptx_gen.mermaid_utils import normalize_mermaid_source
 from pptx_gen.schemas import PageGenerationResult
 
 
@@ -80,6 +81,11 @@ class MermaidRenderer:
             for element in result.elements:
                 if element.type != "image" or element.image_source_type != "mermaid" or not element.mermaid_source.strip():
                     continue
+                mermaid_syntax, mermaid_source = normalize_mermaid_source(element.diagram_kind, element.mermaid_source)
+                if mermaid_syntax:
+                    element.mermaid_syntax = mermaid_syntax
+                if mermaid_source:
+                    element.mermaid_source = mermaid_source
                 mermaid_path = mermaid_root / f"page_{result.page_no:02d}_{element.id}.mmd"
                 png_path = rendered_root / f"page_{result.page_no:02d}_{element.id}.png"
                 mermaid_path.write_text(element.mermaid_source, encoding="utf-8")

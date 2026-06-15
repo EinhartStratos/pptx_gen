@@ -90,48 +90,79 @@ class PPTBuilder:
             return [result]
 
         body_element = result_element_map[body_rule["id"]]
-        chunks = self._split_text_to_fit(body_rule, body_element.content or "")
+        chunks = self._split_text_to_fit(page_rule, body_rule, body_element.content or "")
         if len(chunks) <= 1:
             return [result]
 
         return [self._clone_result_with_text(result, body_element.id, chunk) for chunk in chunks]
 
-    def _split_text_to_fit(self, rule: dict, text: str) -> list[str]:
-        chars_per_line, line_slots = self._estimate_text_capacity(rule)
+    def _split_text_to_fit(self, page_rule: dict, rule: dict, text: str) -> list[str]:
+        chars_per_line, line_slots = self._estimate_text_capacity(page_rule, rule)
         if chars_per_line <= 0 or line_slots <= 0:
             return [text]
 
-        wrapped_lines: list[str] = []
+        wrapped_blocks: list[list[str]] = []
         for raw_line in text.splitlines():
             stripped = raw_line.strip()
             if not stripped:
                 continue
-            wrapped_lines.extend(self._wrap_line(stripped, chars_per_line))
+            wrapped = self._wrap_line(stripped, chars_per_line)
+            if wrapped:
+                wrapped_blocks.append(wrapped)
+
+        wrapped_lines = [line for block in wrapped_blocks for line in block]
 
         if len(wrapped_lines) <= line_slots:
             return [text]
 
         chunks: list[str] = []
         current_lines: list[str] = []
-        for line in wrapped_lines:
-            if len(current_lines) >= line_slots:
+        for block in wrapped_blocks:
+            if len(block) > line_slots:
+                if current_lines:
+                    chunks.append("\n".join(current_lines).strip())
+                    current_lines = []
+                for start in range(0, len(block), line_slots):
+                    part = block[start : start + line_slots]
+                    chunks.append("\n".join(part).strip())
+                continue
+
+            if current_lines and len(current_lines) + len(block) > line_slots:
                 chunks.append("\n".join(current_lines).strip())
-                current_lines = [line]
+                current_lines = list(block)
             else:
-                current_lines.append(line)
+                current_lines.extend(block)
         if current_lines:
             chunks.append("\n".join(current_lines).strip())
         return [chunk for chunk in chunks if chunk]
 
-    def _estimate_text_capacity(self, rule: dict) -> tuple[int, int]:
+    def _estimate_text_capacity(self, page_rule: dict, rule: dict) -> tuple[int, int]:
         bbox = rule.get("bbox") or {}
         style = rule.get("style") or {}
-        width_pt = max(int(bbox.get("w", 0)), 0) / 12700
-        height_pt = max(int(bbox.get("h", 0)), 0) / 12700
+        margins = style.get("margins") or {}
+        width_pt = max(int(bbox.get("w", 0)) - int(margins.get("left", 0)) - int(margins.get("right", 0)), 0) / 12700
+        height_pt = max(int(bbox.get("h", 0)) - int(margins.get("top", 0)) - int(margins.get("bottom", 0)), 0) / 12700
         font_pt = max((style.get("font_size") or 1200) / 100, 10)
-        chars_per_line = max(int(width_pt / (font_pt * 1.75)), 1)
-        line_slots = max(int(height_pt / (font_pt * 1.7)), 1)
+        font_hint_pt, line_spacing = self._extract_text_layout_hint(page_rule)
+        font_pt = max(font_pt, font_hint_pt)
+        chars_per_line = max(int(width_pt / (font_pt * 2.3)), 1)
+        line_slots = max(int(height_pt / (font_pt * line_spacing * 1.15)), 1)
         return chars_per_line, line_slots
+
+    def _extract_text_layout_hint(self, page_rule: dict) -> tuple[float, float]:
+        font_pt = 0.0
+        line_spacing = 1.4
+        for element in page_rule.get("elements", []):
+            if element.get("type") != "text":
+                continue
+            default_text = element.get("default_text") or ""
+            font_match = re.search(r"(\d+(?:\.\d+)?)\s*磅", default_text)
+            spacing_match = re.search(r"(\d+(?:\.\d+)?)\s*倍行间距", default_text)
+            if font_match:
+                font_pt = max(font_pt, float(font_match.group(1)))
+            if spacing_match:
+                line_spacing = max(line_spacing, float(spacing_match.group(1)))
+        return font_pt, line_spacing
 
     def _wrap_line(self, text: str, width: int) -> list[str]:
         if len(text) <= width:
