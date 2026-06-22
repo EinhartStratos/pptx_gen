@@ -17,15 +17,43 @@ def normalize_mermaid_source(diagram_kind: str | None, mermaid_source: str | Non
     if not source:
         return "", ""
 
-    first_line = _first_non_empty_line(source)
-    if first_line == "architecture-beta":
-        normalized = _sanitize_class_diagram(_convert_architecture_beta_to_class_diagram(source))
-        return _first_non_empty_line(normalized), normalized
-    if first_line == "classDiagram":
+    syntax = _detect_mermaid_syntax(source)
+    if syntax == "architecture-beta":
+        normalized = _sanitize_class_diagram(_convert_architecture_beta_to_class_diagram(_strip_frontmatter(source)))
+        return "classDiagram", normalized
+    if syntax == "classDiagram":
+        if _has_frontmatter(source):
+            return "classDiagram", source
         normalized = _sanitize_class_diagram(source)
-        return _first_non_empty_line(normalized), normalized
+        return "classDiagram", normalized
 
-    return first_line, source
+    return syntax, source
+
+
+def _detect_mermaid_syntax(source: str) -> str:
+    if not _has_frontmatter(source):
+        return _first_non_empty_line(source)
+    return _first_non_empty_line(_strip_frontmatter(source))
+
+
+def _has_frontmatter(source: str) -> bool:
+    lines = [line.strip() for line in source.splitlines() if line.strip()]
+    return len(lines) >= 3 and lines[0] == "---" and "---" in lines[1:]
+
+
+def _strip_frontmatter(source: str) -> str:
+    if not _has_frontmatter(source):
+        return source
+    delimiter_count = 0
+    body_lines: list[str] = []
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped == "---":
+            delimiter_count += 1
+            continue
+        if delimiter_count >= 2:
+            body_lines.append(line)
+    return "\n".join(body_lines).strip()
 
 
 def _convert_architecture_beta_to_class_diagram(source: str) -> str:
@@ -69,11 +97,12 @@ def _convert_architecture_beta_to_class_diagram(source: str) -> str:
 
     rendered_lines = ["classDiagram", "  direction LR"]
     grouped_service_ids: set[str] = set()
+    used_namespace_names: set[str] = set()
     for group_id, label in group_labels.items():
         members = [service_id for service_id in service_order if service_groups.get(service_id) == group_id]
         if not members:
             continue
-        rendered_lines.append(f'  namespace {group_id}["{label}"] {{')
+        rendered_lines.append(f"  namespace {_normalize_namespace_name(label, group_id, used_namespace_names)} {{")
         for service_id in members:
             grouped_service_ids.add(service_id)
             rendered_lines.append(f'    class {service_id}["{service_labels[service_id]}"]')
@@ -96,13 +125,14 @@ def _convert_architecture_beta_to_class_diagram(source: str) -> str:
 def _sanitize_class_diagram(source: str) -> str:
     logical_lines = _to_logical_lines(source)
     if not logical_lines:
-        return 'classDiagram\n  class node_1["系统架构图"]'
+        return _with_class_diagram_config('classDiagram\n  class node_1["系统架构图"]')
 
     id_map: dict[str, str] = {}
     namespace_labels: dict[str, str] = {}
+    namespace_name_map: dict[str, str] = {}
     class_labels: dict[str, str] = {}
-    namespace_count = 1
     class_count = 1
+    used_namespace_names: set[str] = set()
 
     for line in logical_lines[1:]:
         if line.startswith("namespace "):
@@ -111,11 +141,9 @@ def _sanitize_class_diagram(source: str) -> str:
                 continue
             original_id = match.group("id")
             label = _clean_label(match.group("label") or original_id)
-            if original_id not in id_map:
-                id_map[original_id] = original_id if _SAFE_ID_RE.fullmatch(original_id) else f"ns_{namespace_count}"
-                if not _SAFE_ID_RE.fullmatch(original_id):
-                    namespace_count += 1
             namespace_labels[original_id] = label
+            if original_id not in namespace_name_map:
+                namespace_name_map[original_id] = _normalize_namespace_name(label, original_id, used_namespace_names)
             continue
 
         if line.startswith("class "):
@@ -146,7 +174,7 @@ def _sanitize_class_diagram(source: str) -> str:
             if not match:
                 continue
             original_id = match.group("id")
-            rendered_lines.append(f'  namespace {id_map[original_id]}["{namespace_labels[original_id]}"] {{')
+            rendered_lines.append(f"  namespace {namespace_name_map[original_id]} {{")
             continue
         if line.startswith("class "):
             match = _CLASS_RE.match(line)
@@ -161,7 +189,28 @@ def _sanitize_class_diagram(source: str) -> str:
             normalized_line = normalized_line.replace(original_id, safe_id)
         rendered_lines.append(normalized_line)
 
-    return "\n".join(rendered_lines)
+    return _with_class_diagram_config("\n".join(rendered_lines))
+
+
+def _normalize_namespace_name(label: str, fallback: str, used_names: set[str]) -> str:
+    candidate = re.sub(r"\s+", "", label)
+    candidate = re.sub(r"[^\w.-]", "_", candidate)
+    candidate = candidate.strip("_")
+    if not candidate:
+        candidate = fallback if _SAFE_ID_RE.fullmatch(fallback) else f"ns_{len(used_names) + 1}"
+    unique_name = candidate
+    suffix = 2
+    while unique_name in used_names:
+        unique_name = f"{candidate}_{suffix}"
+        suffix += 1
+    used_names.add(unique_name)
+    return unique_name
+
+
+def _with_class_diagram_config(source: str) -> str:
+    if "hideEmptyMembersBox" in source:
+        return source
+    return "---\nconfig:\n  class:\n    hideEmptyMembersBox: true\n---\n" + source
 
 
 def _convert_edge_line(line: str, known_nodes: set[str]) -> str | None:

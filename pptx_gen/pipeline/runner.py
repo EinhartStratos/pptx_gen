@@ -40,8 +40,6 @@ class PipelineRunner:
             for page in page_results
             for element in page.elements
         ):
-            if not renderer.is_available():
-                raise RuntimeError("检测到 Mermaid 图片任务，但当前环境找不到 mmdc 命令。")
             page_results = renderer.render_page_results(page_results, self.paths.mermaid_dir, self.paths.rendered_dir)
             self._persist_page_results(page_results)
 

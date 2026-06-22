@@ -45,9 +45,11 @@ def build_user_prompt(requirement_text: str, page_rule: dict) -> str:
     mermaid_instruction = ""
     if any(element.get("type") == "image" and element.get("diagram_kind") == "architecture" for element in page_rule.get("elements", [])):
         mermaid_instruction = (
-            "10. 架构图页面优先输出 classDiagram，不要使用 architecture-beta。使用 namespace 表示系统或渠道分组，"
-            "使用带标签的 class 表示组件名称，组件名称放在框内；连线可使用 --> 或 --。"
-            "请使用 ASCII 标识符加中文标签，例如 namespace sysA[\"渠道系统\"]、class compA[\"PTMS-IMS\"]。\n"
+            "10. 架构图页面请按场景选 Mermaid 语法：如果是分层展示、系统分组、几乎没有箭头，请优先输出 block；"
+            "如果必须表达系统之间的依赖或交互，再输出 classDiagram；不要使用 architecture-beta。"
+            "使用 classDiagram 时，namespace 请直接写分组名，例如 namespace 外部系统 { ... }，不要写 namespace sysA[\"外部系统\"]。"
+            "class 可以写成 class compA[\"PTMS-IMS\"]，并建议通过 frontmatter 配置 hideEmptyMembersBox: true 去掉空白分格。"
+            "如果需要不同系统不同颜色，优先给各系统下的节点使用 classDef/cssClass 设置不同颜色；如果是纯分层展示，优先改用 block。\n"
         )
     output_schema = {
         "page_no": page_rule["page_no"],
@@ -71,7 +73,7 @@ def build_user_prompt(requirement_text: str, page_rule: dict) -> str:
                 "image_source_type": "mermaid",
                 "diagram_kind": "architecture",
                 "mermaid_syntax": "classDiagram",
-                "mermaid_source": "classDiagram\n  direction LR\n  namespace sysA[\"渠道系统\"] {\n    class compA[\"PTMS-IMS\"]\n  }",
+                "mermaid_source": "---\nconfig:\n  class:\n    hideEmptyMembersBox: true\n---\nclassDiagram\n  direction LR\n  namespace 外部系统 {\n    class compA[\"PTMS-IMS\"]\n  }",
             },
         ],
     }

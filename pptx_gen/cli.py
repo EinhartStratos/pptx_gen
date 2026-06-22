@@ -69,8 +69,6 @@ def main() -> None:
 
     if args.command == "render-mermaid":
         renderer = MermaidRenderer(args.cli_command)
-        if not renderer.is_available():
-            raise RuntimeError(f"找不到 Mermaid CLI 命令: {args.cli_command}")
         pages = _load_pages(args.pages_dir)
         renderer.render_page_results(pages, args.mermaid_dir, args.rendered_dir)
         _save_pages(args.pages_dir, pages)

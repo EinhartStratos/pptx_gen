@@ -86,12 +86,17 @@ class MockLLMClient(BaseLLMClient):
         if diagram_kind == "flowchart":
             return "flowchart TD\nA[输入需求] --> B[解析模板]\nB --> C[生成页面]\nC --> D[输出PPT]"
         return (
+            "---\n"
+            "config:\n"
+            "  class:\n"
+            "    hideEmptyMembersBox: true\n"
+            "---\n"
             "classDiagram\n"
             "  direction LR\n"
-            '  namespace channel["访问渠道"] {\n'
+            '  namespace 访问渠道 {\n'
             '    class Browser["浏览器"]\n'
             "  }\n"
-            '  namespace systems["业务系统"] {\n'
+            '  namespace 业务系统 {\n'
             '    class PTMS_IMS["PTMS-IMS"]\n'
             '    class ModelService["模型服务"]\n'
             "  }\n"

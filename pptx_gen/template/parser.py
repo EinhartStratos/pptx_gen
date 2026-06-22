@@ -25,7 +25,10 @@ class TemplateRuleParser:
         presentation = Presentation(self.template_path)
         with zipfile.ZipFile(self.template_path) as archive:
             slide_names = self._sorted_slide_names(archive)
-            pages = [self._parse_slide(archive, slide_name, index) for index, slide_name in enumerate(slide_names, start=1)]
+            pages = [
+                self._parse_slide(archive, slide_name, presentation.slides[index - 1], index)
+                for index, slide_name in enumerate(slide_names, start=1)
+            ]
         template = TemplateMeta(
             file_name=self.template_path.name,
             slide_count=len(pages),
@@ -44,7 +47,7 @@ class TemplateRuleParser:
         names = [name for name in archive.namelist() if re.match(r"ppt/slides/slide\d+\.xml$", name)]
         return sorted(names, key=lambda item: int(re.search(r"slide(\d+)\.xml$", item).group(1)))
 
-    def _parse_slide(self, archive: zipfile.ZipFile, slide_name: str, page_no: int) -> PageRule:
+    def _parse_slide(self, archive: zipfile.ZipFile, slide_name: str, slide, page_no: int) -> PageRule:
         root = ET.fromstring(archive.read(slide_name))
         sp_tree = root.find(".//p:spTree", self.NS)
         if sp_tree is None:
@@ -76,7 +79,7 @@ class TemplateRuleParser:
                     )
                 elements.append(parsed)
             elif tag == "graphicFrame":
-                parsed = self._parse_table(child, page_no, z_order)
+                parsed = self._parse_table(child, slide, page_no, z_order)
                 z_order += 1
                 if parsed is not None:
                     elements.append(parsed)
@@ -131,7 +134,7 @@ class TemplateRuleParser:
             is_instructional=is_instructional,
         )
 
-    def _parse_table(self, node: ET.Element, page_no: int, z_order: int) -> ElementRule | None:
+    def _parse_table(self, node: ET.Element, slide, page_no: int, z_order: int) -> ElementRule | None:
         table = node.find(".//a:tbl", self.NS)
         c_nv_pr = node.find("./p:nvGraphicFramePr/p:cNvPr", self.NS)
         xfrm = node.find("./p:xfrm", self.NS)
@@ -147,6 +150,8 @@ class TemplateRuleParser:
             for cell in row.findall("./a:tc", self.NS):
                 values.append(self._extract_text(cell))
             cell_texts.append(values)
+        shape = next((item for item in slide.shapes if item.shape_id == shape_id and getattr(item, "has_table", False)), None)
+        style = self._parse_table_style(shape) if shape is not None else self._default_table_style()
         return ElementRule(
             id=f"table_{shape_id}",
             shape_id=shape_id,
@@ -157,7 +162,7 @@ class TemplateRuleParser:
             z_order=z_order,
             editable=True,
             default_text=self._normalize_default_text("\n".join([" | ".join(row) for row in cell_texts])),
-            style=None,
+            style=style,
             content_requirement="按模板表格结构填写内容，输出行列清晰、不要超过模板容量。",
             fill_strategy="fill_table",
             table_schema=TableSchema(
@@ -181,8 +186,10 @@ class TemplateRuleParser:
         content_requirement = f"若当前页适合图形表达，请输出 {diagram_kind} 类型的 Mermaid 语法并用于渲染图片。"
         if diagram_kind == "architecture":
             content_requirement = (
-                "若当前页适合图形表达，请优先输出 classDiagram。使用 namespace 表示系统或渠道分组，"
-                "使用带标签的 class 表示组件名称，组件名称放在框内；连线可使用 --> 或 --，不要使用 architecture-beta。"
+                "若当前页适合图形表达，请按场景选择 Mermaid：如果是分层展示、系统分组、几乎没有箭头，请优先输出 block；"
+                "如果必须表达系统之间的依赖或交互，再输出 classDiagram。使用 classDiagram 时，namespace 请直接写分组名，"
+                "例如 namespace 外部系统 { ... }，不要写 namespace sysA[\"外部系统\"]；class 可以写成 class compA[\"PTMS-IMS\"]。"
+                "如需去掉空白分格，可在 frontmatter 中开启 hideEmptyMembersBox: true；不要使用 architecture-beta。"
             )
         return ElementRule(
             id=f"image_{shape_id}",
@@ -247,6 +254,161 @@ class TemplateRuleParser:
             elif scheme_color is not None:
                 style["font_color_scheme"] = scheme_color.attrib.get("val", "")
         return style or None
+
+    def _parse_table_style(self, shape) -> dict[str, object]:
+        default_style = self._default_table_style()
+        table = shape.table
+        header_cells = [table.cell(0, col_index) for col_index in range(len(table.columns))] if len(table.rows) else []
+        body_cells = []
+        fallback_body_cells = []
+        for row_index in range(1, len(table.rows)):
+            for col_index in range(len(table.columns)):
+                cell = table.cell(row_index, col_index)
+                if cell.text.strip():
+                    fallback_body_cells.append(cell)
+                if self._is_meaningful_body_cell_text(cell.text):
+                    body_cells.append(cell)
+        header_style = self._extract_table_cell_style(header_cells)
+        body_style = self._extract_table_cell_style(body_cells) or self._extract_table_cell_style(fallback_body_cells)
+        resolved_header = self._merge_table_text_style(default_style["header_style"], header_style)
+        resolved_body = self._merge_table_text_style(default_style["body_style"], body_style)
+        return {
+            "font_name": resolved_body["font_name"],
+            "font_size": resolved_body["font_size"],
+            "bold": resolved_body.get("bold", False),
+            "italic": resolved_body.get("italic", False),
+            "alignment": resolved_body.get("alignment", "left"),
+            "vertical_anchor": resolved_body.get("vertical_anchor", "middle"),
+            "margins": dict(resolved_body.get("margins") or {}),
+            "row_heights": [int(row.height) for row in table.rows],
+            "column_widths": [int(column.width) for column in table.columns],
+            "header_style": resolved_header,
+            "body_style": resolved_body,
+        }
+
+    def _extract_table_cell_style(self, cells: list) -> dict[str, object] | None:
+        for cell in cells:
+            text_frame = cell.text_frame
+            paragraph = next((item for item in text_frame.paragraphs if item.text.strip()), None)
+            if paragraph is None and text_frame.paragraphs:
+                paragraph = text_frame.paragraphs[0]
+            if paragraph is None:
+                continue
+            run = next((item for item in paragraph.runs if item.text.strip()), None)
+            if run is None and paragraph.runs:
+                run = paragraph.runs[0]
+            style: dict[str, object] = {
+                "margins": {
+                    "left": int(cell.margin_left),
+                    "top": int(cell.margin_top),
+                    "right": int(cell.margin_right),
+                    "bottom": int(cell.margin_bottom),
+                }
+            }
+            if paragraph.alignment is not None:
+                style["alignment"] = self._normalize_alignment(paragraph.alignment)
+            if cell.vertical_anchor is not None:
+                style["vertical_anchor"] = self._normalize_vertical_anchor(cell.vertical_anchor)
+            if run is not None:
+                font = run.font
+                if font.name:
+                    style["font_name"] = font.name
+                if font.size:
+                    style["font_size"] = int(round(font.size.pt * 100))
+                if font.bold is not None:
+                    style["bold"] = font.bold
+                if font.italic is not None:
+                    style["italic"] = font.italic
+            if style:
+                return style
+        return None
+
+    def _default_table_style(self) -> dict[str, object]:
+        header_style = {
+            "font_name": "微软雅黑",
+            "font_size": 1400,
+            "bold": True,
+            "italic": False,
+            "alignment": "center",
+            "vertical_anchor": "middle",
+            "margins": {
+                "left": 91440,
+                "top": 45720,
+                "right": 91440,
+                "bottom": 45720,
+            },
+        }
+        body_style = {
+            "font_name": "微软雅黑",
+            "font_size": 1400,
+            "bold": False,
+            "italic": False,
+            "alignment": "left",
+            "vertical_anchor": "middle",
+            "margins": {
+                "left": 68580,
+                "top": 0,
+                "right": 68580,
+                "bottom": 0,
+            },
+        }
+        return {
+            "font_name": body_style["font_name"],
+            "font_size": body_style["font_size"],
+            "bold": body_style["bold"],
+            "italic": body_style["italic"],
+            "alignment": body_style["alignment"],
+            "vertical_anchor": body_style["vertical_anchor"],
+            "margins": dict(body_style["margins"]),
+            "row_heights": [],
+            "column_widths": [],
+            "header_style": header_style,
+            "body_style": body_style,
+        }
+
+    def _merge_table_text_style(self, base_style: dict[str, object], override_style: dict[str, object] | None) -> dict[str, object]:
+        merged = dict(base_style)
+        merged["margins"] = dict(base_style.get("margins") or {})
+        if not override_style:
+            return merged
+        for key, value in override_style.items():
+            if key == "margins":
+                merged["margins"].update(value or {})
+            else:
+                merged[key] = value
+        return merged
+
+    def _is_meaningful_body_cell_text(self, text: str) -> bool:
+        normalized = re.sub(r"[\s\d…·,.，。:：;；()（）/\\\-]+", "", text or "")
+        return bool(normalized)
+
+    def _normalize_alignment(self, alignment) -> str:
+        name = getattr(alignment, "name", "")
+        if not name:
+            return "left"
+        lowered = name.lower()
+        mapping = {
+            "left": "left",
+            "center": "center",
+            "right": "right",
+            "justify": "justify",
+            "distribute": "distribute",
+            "thai_distribute": "distribute",
+            "justify_low": "justify",
+        }
+        return mapping.get(lowered, "left")
+
+    def _normalize_vertical_anchor(self, anchor) -> str:
+        name = getattr(anchor, "name", "")
+        if not name:
+            return "middle"
+        lowered = name.lower()
+        mapping = {
+            "top": "top",
+            "middle": "middle",
+            "bottom": "bottom",
+        }
+        return mapping.get(lowered, "middle")
 
     def _extract_text(self, node: ET.Element) -> str:
         texts = [text.text or "" for text in node.findall(".//a:t", self.NS)]

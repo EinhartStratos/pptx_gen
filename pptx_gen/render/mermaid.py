@@ -149,6 +149,8 @@ class MermaidRenderer:
         rendered_root = Path(rendered_dir)
         mermaid_root.mkdir(parents=True, exist_ok=True)
         rendered_root.mkdir(parents=True, exist_ok=True)
+        cli_available = self.is_available()
+        missing_cli_warned = False
         for result in page_results:
             for element in result.elements:
                 if element.type != "image" or element.image_source_type != "mermaid" or not element.mermaid_source.strip():
@@ -160,7 +162,21 @@ class MermaidRenderer:
                     element.mermaid_source = mermaid_source
                 mermaid_path = mermaid_root / f"page_{result.page_no:02d}_{element.id}.mmd"
                 png_path = rendered_root / f"page_{result.page_no:02d}_{element.id}.png"
+                element.rendered_path = None
                 mermaid_path.write_text(element.mermaid_source, encoding="utf-8")
-                self.render_file(mermaid_path, png_path)
+                if not cli_available:
+                    if not missing_cli_warned:
+                        print(f"警告：找不到 Mermaid CLI 命令，已跳过 Mermaid 图片渲染：{self.cli_command}", file=sys.stderr)
+                        missing_cli_warned = True
+                    continue
+                if png_path.exists():
+                    png_path.unlink()
+                try:
+                    self.render_file(mermaid_path, png_path)
+                except RuntimeError as exc:
+                    if png_path.exists():
+                        png_path.unlink()
+                    print(str(exc), file=sys.stderr)
+                    continue
                 element.rendered_path = str(png_path)
         return page_results

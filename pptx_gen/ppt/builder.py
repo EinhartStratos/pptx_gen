@@ -6,7 +6,9 @@ import json
 import re
 
 from pptx import Presentation
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.slide import Slide
+from pptx.util import Pt
 
 from pptx_gen.schemas import GeneratedElement, PageGenerationResult
 
@@ -20,23 +22,32 @@ class PPTBuilder:
         page_results = self._load_page_results(page_results_path)
         page_result_map = {item.page_no: item for item in page_results}
         page_rule_map = {int(page["page_no"]): page for page in rules["pages"]}
+        slide_size = (rules.get("template") or {}).get("slide_size") or {}
 
         presentation = Presentation(self.template_path)
-        for slide_index in reversed(range(len(presentation.slides))):
+        delete_slide_indices: list[int] = []
+        original_slide_count = len(presentation.slides)
+        for slide_index in reversed(range(original_slide_count)):
             page_no = slide_index + 1
             result = page_result_map.get(page_no)
             page_rule = page_rule_map.get(page_no)
             if result is None or page_rule is None or not result.should_generate:
-                self._delete_slide(presentation, slide_index)
+                delete_slide_indices.append(slide_index)
                 continue
-            split_results = self._expand_result_for_overflow(page_rule, result)
+            expanded_results = self._expand_result_for_overflow(slide_size, page_rule, result)
             slide = presentation.slides[slide_index]
-            self._fill_slide(slide, page_rule, split_results[0])
             insert_after_index = slide_index
-            for extra_result in split_results[1:]:
+            duplicated_slides: list[Slide] = []
+            for _ in expanded_results[1:]:
                 duplicated_slide = self._duplicate_slide_after(presentation, insert_after_index)
-                self._fill_slide(duplicated_slide, page_rule, extra_result)
+                duplicated_slides.append(duplicated_slide)
                 insert_after_index += 1
+            self._fill_slide(slide, page_rule, expanded_results[0][0], expanded_results[0][1])
+            for duplicated_slide, (extra_result, layout_overrides) in zip(duplicated_slides, expanded_results[1:]):
+                self._fill_slide(duplicated_slide, page_rule, extra_result, layout_overrides)
+
+        for slide_index in sorted(delete_slide_indices, reverse=True):
+            self._delete_slide(presentation, slide_index)
 
         target = Path(output_path)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -51,27 +62,33 @@ class PPTBuilder:
             items.append(PageGenerationResult.model_validate(payload))
         return items
 
-    def _fill_slide(self, slide: Slide, page_rule: dict, result: PageGenerationResult) -> None:
+    def _fill_slide(self, slide: Slide, page_rule: dict, result: PageGenerationResult, layout_overrides: dict[str, dict[str, object]] | None = None) -> None:
+        layout_overrides = layout_overrides or {}
         rule_element_map = {item["id"]: item for item in page_rule.get("elements", [])}
         result_element_map = {item.id: item for item in result.elements}
         shape_map = {shape.shape_id: shape for shape in slide.shapes}
         for element_id, rule in rule_element_map.items():
             shape = shape_map.get(int(rule["shape_id"]))
             result_element = result_element_map.get(element_id)
+            layout_override = layout_overrides.get(element_id) or {}
             if rule["type"] in {"title", "text"}:
                 if shape is not None and hasattr(shape, "text_frame"):
+                    self._set_shape_layout(shape, rule, layout_override)
                     self._set_text(shape, (result_element.content if result_element is not None else "") or "")
             elif rule["type"] == "table":
                 if shape is not None and getattr(shape, "has_table", False):
-                    self._fill_table(shape.table, result_element)
+                    if result_element is None or not ((result_element.headers or []) or (result_element.rows or [])):
+                        self._remove_shape(shape)
+                        continue
+                    self._fill_table(shape, rule, result_element, layout_override)
             elif rule["type"] == "image":
-                self._place_image(slide, shape, rule, result_element)
+                self._place_image(slide, shape, rule, result_element, layout_override)
 
-    def _expand_result_for_overflow(self, page_rule: dict, result: PageGenerationResult) -> list[PageGenerationResult]:
+    def _expand_result_for_overflow(self, slide_size: dict, page_rule: dict, result: PageGenerationResult) -> list[tuple[PageGenerationResult, dict[str, dict[str, object]]]]:
         if page_rule.get("page_purpose") != "text":
-            return [result]
+            return self._expand_mixed_result_for_overflow(slide_size, page_rule, result)
         if any(item.get("type") in {"table", "image"} for item in page_rule.get("elements", [])):
-            return [result]
+            return self._expand_mixed_result_for_overflow(slide_size, page_rule, result)
 
         result_element_map = {item.id: item for item in result.elements}
         body_rules = [
@@ -82,59 +99,245 @@ class PPTBuilder:
             and (result_element_map[item["id"]].content or "").strip()
         ]
         if len(body_rules) != 1:
-            return [result]
+            return [(result, {})]
 
         body_rule = body_rules[0]
         content_requirement = body_rule.get("content_requirement") or ""
         if "可分多页" not in content_requirement and "分多页" not in content_requirement:
-            return [result]
+            return [(result, {})]
 
         body_element = result_element_map[body_rule["id"]]
         chunks = self._split_text_to_fit(page_rule, body_rule, body_element.content or "")
         if len(chunks) <= 1:
-            return [result]
+            return [(result, {})]
 
-        return [self._clone_result_with_text(result, body_element.id, chunk) for chunk in chunks]
+        return [(self._clone_result_with_text(result, body_element.id, chunk), {}) for chunk in chunks]
+
+    def _expand_mixed_result_for_overflow(self, slide_size: dict, page_rule: dict, result: PageGenerationResult) -> list[tuple[PageGenerationResult, dict[str, dict[str, object]]]]:
+        bands = self._build_layout_bands(page_rule, result)
+        if not bands:
+            return [(result, {})]
+
+        content_start_top = min(band["original_top"] for band in bands)
+        slide_bottom = int(slide_size.get("cy") or 0) or max(
+            rule.get("bbox", {}).get("y", 0) + rule.get("bbox", {}).get("h", 0) for rule in page_rule.get("elements", [])
+        )
+        slides: list[tuple[PageGenerationResult, dict[str, dict[str, object]]]] = []
+        current_element_map: dict[str, GeneratedElement] = {}
+        current_layout: dict[str, dict[str, object]] = {}
+        current_bottom = 0
+        previous_band = None
+
+        for band in bands:
+            segments = self._expand_band_segments(band)
+            for segment_index, segment in enumerate(segments):
+                if segment_index > 0 and current_element_map:
+                    slides.append((self._clone_result_with_element_map(result, current_element_map), current_layout))
+                    current_element_map = {}
+                    current_layout = {}
+                    current_bottom = 0
+                    previous_band = None
+                gap = 0
+                if current_element_map and segment_index == 0 and previous_band is not None:
+                    gap = max(int(band["original_top"]) - int(previous_band["original_bottom"]), 0)
+                proposed_top = content_start_top if not current_element_map else current_bottom + gap
+                if current_element_map and proposed_top + int(segment["required_height"]) > slide_bottom:
+                    slides.append((self._clone_result_with_element_map(result, current_element_map), current_layout))
+                    current_element_map = {}
+                    current_layout = {}
+                    current_bottom = 0
+                    previous_band = None
+                    proposed_top = content_start_top
+                for item in segment["items"]:
+                    current_element_map[item["element"].id] = item["element"]
+                    override = {
+                        "y": int(proposed_top + int(item["rule"]["bbox"]["y"]) - int(band["original_top"])),
+                        "h": int(item["height"]),
+                    }
+                    if item.get("row_heights") is not None:
+                        override["row_heights"] = item["row_heights"]
+                    current_layout[item["element"].id] = override
+                current_bottom = proposed_top + int(segment["required_height"])
+                previous_band = band
+
+        if current_element_map:
+            slides.append((self._clone_result_with_element_map(result, current_element_map), current_layout))
+        return slides or [(result, {})]
+
+    def _build_layout_bands(self, page_rule: dict, result: PageGenerationResult) -> list[dict[str, object]]:
+        result_element_map = {item.id: item for item in result.elements}
+        active_rules = []
+        for rule in sorted(page_rule.get("elements", []), key=lambda item: (item.get("bbox", {}).get("y", 0), item.get("z_order", 0))):
+            if rule.get("type") == "title":
+                continue
+            result_element = result_element_map.get(rule["id"])
+            if not self._has_visible_result_element(rule, result_element):
+                continue
+            height = self._estimate_element_height(page_rule, rule, result_element)
+            span_height = min(int(rule.get("bbox", {}).get("h", 0) or 0), max(height, 1)) or max(height, 1)
+            active_rules.append(
+                {
+                    "rule": rule,
+                    "element": result_element.model_copy(deep=True),
+                    "height": height,
+                    "span_end": int(rule["bbox"]["y"]) + span_height,
+                }
+            )
+        if not active_rules:
+            return []
+
+        bands: list[dict[str, object]] = []
+        for item in active_rules:
+            if not bands or int(item["rule"]["bbox"]["y"]) > int(bands[-1]["span_end"]) + 20000:
+                bands.append(
+                    {
+                        "original_top": int(item["rule"]["bbox"]["y"]),
+                        "original_bottom": int(item["rule"]["bbox"]["y"]) + int(item["rule"]["bbox"]["h"]),
+                        "span_end": int(item["span_end"]),
+                        "items": [item],
+                    }
+                )
+                continue
+            band = bands[-1]
+            band["items"].append(item)
+            band["original_top"] = min(int(band["original_top"]), int(item["rule"]["bbox"]["y"]))
+            band["original_bottom"] = max(
+                int(band["original_bottom"]),
+                int(item["rule"]["bbox"]["y"]) + int(item["rule"]["bbox"]["h"]),
+            )
+            band["span_end"] = max(int(band["span_end"]), int(item["span_end"]))
+        return bands
+
+    def _expand_band_segments(self, band: dict[str, object]) -> list[dict[str, object]]:
+        band_items = band["items"]
+        table_chunks: dict[str, list[dict[str, object]]] = {}
+        segment_count = 1
+        for item in band_items:
+            rule = item["rule"]
+            if rule.get("type") != "table":
+                continue
+            chunks = self._chunk_table_element(rule, item["element"])
+            table_chunks[rule["id"]] = chunks
+            segment_count = max(segment_count, len(chunks))
+
+        segments: list[dict[str, object]] = []
+        for segment_index in range(segment_count):
+            segment_items: list[dict[str, object]] = []
+            required_height = 0
+            for item in band_items:
+                rule = item["rule"]
+                if rule.get("type") == "table":
+                    chunks = table_chunks.get(rule["id"], [])
+                    if segment_index >= len(chunks):
+                        continue
+                    chunk = chunks[segment_index]
+                    segment_items.append(
+                        {
+                            "rule": rule,
+                            "element": chunk["element"],
+                            "height": chunk["height"],
+                            "row_heights": chunk["row_heights"],
+                        }
+                    )
+                    required_height = max(required_height, int(chunk["height"]))
+                    continue
+                segment_items.append(
+                    {
+                        "rule": rule,
+                        "element": item["element"].model_copy(deep=True),
+                        "height": int(item["height"]),
+                        "row_heights": None,
+                    }
+                )
+                required_height = max(required_height, int(item["height"]))
+            if segment_items:
+                segments.append({"items": segment_items, "required_height": required_height})
+        return segments or [{"items": [], "required_height": 0}]
+
+    def _chunk_table_element(self, rule: dict, element: GeneratedElement) -> list[dict[str, object]]:
+        headers = list(element.headers or [])
+        body_rows = list(element.rows or [])
+        template_rows = int(((rule.get("table_schema") or {}).get("rows") or 0))
+        header_rows = 1 if headers else 0
+        body_capacity = max(template_rows - header_rows, 1)
+        if not body_rows:
+            chunk_element = element.model_copy(deep=True)
+            row_heights = self._estimate_table_row_heights(rule, chunk_element)
+            return [{"element": chunk_element, "row_heights": row_heights, "height": sum(row_heights)}]
+
+        chunks: list[dict[str, object]] = []
+        for start in range(0, len(body_rows), body_capacity):
+            chunk_element = element.model_copy(deep=True)
+            chunk_element.headers = headers or None
+            chunk_element.rows = [list(row) for row in body_rows[start : start + body_capacity]]
+            row_heights = self._estimate_table_row_heights(rule, chunk_element)
+            chunks.append({"element": chunk_element, "row_heights": row_heights, "height": sum(row_heights)})
+        return chunks
+
+    def _has_visible_result_element(self, rule: dict, element: GeneratedElement | None) -> bool:
+        if element is None:
+            return False
+        if rule.get("type") in {"title", "text"}:
+            return bool((element.content or "").strip())
+        if rule.get("type") == "table":
+            return bool((element.headers or []) or (element.rows or []))
+        if rule.get("type") == "image":
+            return bool(element.rendered_path)
+        return False
+
+    def _clone_result_with_element_map(self, result: PageGenerationResult, element_map: dict[str, GeneratedElement]) -> PageGenerationResult:
+        cloned_elements: list[GeneratedElement] = []
+        for element in result.elements:
+            mapped = element_map.get(element.id)
+            if mapped is not None:
+                cloned_elements.append(mapped.model_copy(deep=True))
+        return PageGenerationResult(
+            page_no=result.page_no,
+            should_generate=result.should_generate,
+            skip_reason=result.skip_reason,
+            elements=cloned_elements,
+        )
 
     def _split_text_to_fit(self, page_rule: dict, rule: dict, text: str) -> list[str]:
         chars_per_line, line_slots = self._estimate_text_capacity(page_rule, rule)
         if chars_per_line <= 0 or line_slots <= 0:
             return [text]
 
-        wrapped_blocks: list[list[str]] = []
-        for raw_line in text.splitlines():
-            stripped = raw_line.strip()
-            if not stripped:
-                continue
-            wrapped = self._wrap_line(stripped, chars_per_line)
-            if wrapped:
-                wrapped_blocks.append(wrapped)
+        raw_lines = text.splitlines()
+        if not raw_lines:
+            return [text]
 
-        wrapped_lines = [line for block in wrapped_blocks for line in block]
-
-        if len(wrapped_lines) <= line_slots:
+        wrapped_blocks = [self._wrap_line(raw_line, chars_per_line) for raw_line in raw_lines]
+        visual_line_count = sum(max(len(block), 1) for block in wrapped_blocks)
+        if visual_line_count <= line_slots:
             return [text]
 
         chunks: list[str] = []
         current_lines: list[str] = []
-        for block in wrapped_blocks:
-            if len(block) > line_slots:
+        current_visual_lines = 0
+        for raw_line, block in zip(raw_lines, wrapped_blocks):
+            block_visual_lines = max(len(block), 1)
+            if block_visual_lines > line_slots:
                 if current_lines:
-                    chunks.append("\n".join(current_lines).strip())
+                    chunks.append(self._trim_chunk_boundary_blank_lines(current_lines))
                     current_lines = []
+                    current_visual_lines = 0
                 for start in range(0, len(block), line_slots):
                     part = block[start : start + line_slots]
-                    chunks.append("\n".join(part).strip())
+                    chunks.append("".join(part))
                 continue
 
-            if current_lines and len(current_lines) + len(block) > line_slots:
-                chunks.append("\n".join(current_lines).strip())
-                current_lines = list(block)
-            else:
-                current_lines.extend(block)
+            if current_lines and current_visual_lines + block_visual_lines > line_slots:
+                chunks.append(self._trim_chunk_boundary_blank_lines(current_lines))
+                current_lines = [raw_line]
+                current_visual_lines = block_visual_lines
+                continue
+
+            current_lines.append(raw_line)
+            current_visual_lines += block_visual_lines
         if current_lines:
-            chunks.append("\n".join(current_lines).strip())
-        return [chunk for chunk in chunks if chunk]
+            chunks.append(self._trim_chunk_boundary_blank_lines(current_lines))
+        return [chunk for chunk in chunks if chunk.strip()]
 
     def _estimate_text_capacity(self, page_rule: dict, rule: dict) -> tuple[int, int]:
         bbox = rule.get("bbox") or {}
@@ -148,6 +351,97 @@ class PPTBuilder:
         chars_per_line = max(int(width_pt / (font_pt * 2.3)), 1)
         line_slots = max(int(height_pt / (font_pt * line_spacing * 1.15)), 1)
         return chars_per_line, line_slots
+
+    def _estimate_element_height(self, page_rule: dict, rule: dict, element: GeneratedElement) -> int:
+        if rule.get("type") == "table":
+            return max(sum(self._estimate_table_row_heights(rule, element)), int(rule.get("bbox", {}).get("h", 0) or 0))
+        if rule.get("type") == "image":
+            return int(rule.get("bbox", {}).get("h", 0) or 0)
+        if rule.get("type") in {"title", "text"}:
+            return max(self._estimate_text_height(page_rule, rule, (element.content or "")), int(rule.get("bbox", {}).get("h", 0) or 0))
+        return int(rule.get("bbox", {}).get("h", 0) or 0)
+
+    def _estimate_text_height(self, page_rule: dict, rule: dict, text: str) -> int:
+        chars_per_line, _ = self._estimate_text_capacity(page_rule, rule)
+        style = rule.get("style") or {}
+        margins = style.get("margins") or {}
+        font_pt = max((style.get("font_size") or 1200) / 100, 10)
+        font_hint_pt, line_spacing = self._extract_text_layout_hint(page_rule)
+        font_pt = max(font_pt, font_hint_pt)
+        raw_lines = text.splitlines() or [text]
+        visual_lines = 0
+        for raw_line in raw_lines:
+            visual_lines += max(len(self._wrap_line(raw_line, chars_per_line)), 1)
+        content_height = int(visual_lines * font_pt * line_spacing * 12700)
+        return int(margins.get("top", 0)) + int(margins.get("bottom", 0)) + content_height
+
+    def _estimate_table_row_heights(self, rule: dict, element: GeneratedElement) -> list[int]:
+        style = rule.get("style") or {}
+        column_widths = list(style.get("column_widths") or [])
+        if not column_widths:
+            cols = max(int(((rule.get("table_schema") or {}).get("cols") or 1)), 1)
+            total_width = int(rule.get("bbox", {}).get("w", 0) or 0)
+            column_widths = [int(total_width / cols)] * cols
+        template_row_heights = list(style.get("row_heights") or [])
+        header_style = self._resolve_table_text_style(style.get("header_style"), is_header=True)
+        body_style = self._resolve_table_text_style(style.get("body_style"), is_header=False)
+        all_rows: list[list[str]] = []
+        if element.headers:
+            all_rows.append([str(item) for item in element.headers])
+        if element.rows:
+            all_rows.extend([[str(item) for item in row] for row in element.rows])
+        if not all_rows:
+            return template_row_heights or [int(rule.get("bbox", {}).get("h", 0) or 0)]
+
+        row_heights: list[int] = []
+        for row_index, row_values in enumerate(all_rows):
+            cell_style = header_style if row_index == 0 and element.headers else body_style
+            min_height = template_row_heights[row_index] if row_index < len(template_row_heights) else template_row_heights[-1] if template_row_heights else int(cell_style["font_size"] * 16)
+            row_heights.append(self._estimate_table_row_height(row_values, column_widths, cell_style, min_height))
+        return row_heights
+
+    def _estimate_table_row_height(self, row_values: list[str], column_widths: list[int], style: dict[str, object], min_height: int) -> int:
+        font_pt = max((style.get("font_size") or 1400) / 100, 10)
+        margins = style.get("margins") or {}
+        margin_top = int(margins.get("top", 0) or 0)
+        margin_bottom = int(margins.get("bottom", 0) or 0)
+        max_height = min_height
+        for col_index, value in enumerate(row_values):
+            column_width = column_widths[col_index] if col_index < len(column_widths) else column_widths[-1]
+            usable_width_pt = max(column_width - int(margins.get("left", 0) or 0) - int(margins.get("right", 0) or 0), 0) / 12700
+            chars_per_line = max(int(usable_width_pt / (font_pt * 1.35)), 1)
+            line_count = 0
+            for raw_line in (value or "").splitlines() or [value or ""]:
+                line_count += max(len(self._wrap_line(raw_line, chars_per_line)), 1)
+            cell_height = margin_top + margin_bottom + int(max(line_count, 1) * font_pt * 1.25 * 12700)
+            max_height = max(max_height, cell_height)
+        return max_height
+
+    def _resolve_table_text_style(self, style: dict[str, object] | None, *, is_header: bool) -> dict[str, object]:
+        base = {
+            "font_name": "微软雅黑",
+            "font_size": 1400,
+            "bold": is_header,
+            "italic": False,
+            "alignment": "center" if is_header else "left",
+            "vertical_anchor": "middle",
+            "margins": {
+                "left": 91440 if is_header else 68580,
+                "top": 45720 if is_header else 0,
+                "right": 91440 if is_header else 68580,
+                "bottom": 45720 if is_header else 0,
+            },
+        }
+        if not style:
+            return base
+        resolved = dict(base)
+        resolved["margins"] = dict(base["margins"])
+        for key, value in style.items():
+            if key == "margins":
+                resolved["margins"].update(value or {})
+            else:
+                resolved[key] = value
+        return resolved
 
     def _extract_text_layout_hint(self, page_rule: dict) -> tuple[float, float]:
         font_pt = 0.0
@@ -165,6 +459,8 @@ class PPTBuilder:
         return font_pt, line_spacing
 
     def _wrap_line(self, text: str, width: int) -> list[str]:
+        if not text:
+            return [""]
         if len(text) <= width:
             return [text]
 
@@ -172,11 +468,20 @@ class PPTBuilder:
         remaining = text
         while len(remaining) > width:
             split_at = self._find_split_position(remaining, width)
-            wrapped.append(remaining[:split_at].rstrip())
-            remaining = remaining[split_at:].lstrip()
+            wrapped.append(remaining[:split_at])
+            remaining = remaining[split_at:]
         if remaining:
             wrapped.append(remaining)
         return wrapped
+
+    def _trim_chunk_boundary_blank_lines(self, lines: list[str]) -> str:
+        start = 0
+        end = len(lines)
+        while start < end and not lines[start].strip():
+            start += 1
+        while end > start and not lines[end - 1].strip():
+            end -= 1
+        return "\n".join(lines[start:end])
 
     def _find_split_position(self, text: str, width: int) -> int:
         candidate = min(width, len(text))
@@ -223,6 +528,13 @@ class PPTBuilder:
                 if parent is not None:
                     parent.remove(node)
 
+    def _set_shape_layout(self, shape, rule: dict, layout_override: dict[str, object]) -> None:
+        bbox = rule.get("bbox") or {}
+        shape.left = int(layout_override.get("x", bbox.get("x", 0)))
+        shape.top = int(layout_override.get("y", bbox.get("y", 0)))
+        shape.width = int(layout_override.get("w", bbox.get("w", 0)))
+        shape.height = int(layout_override.get("h", bbox.get("h", 0)))
+
     def _set_text(self, shape, content: str) -> None:
         text_frame = shape.text_frame
         paragraph_alignment = None
@@ -249,20 +561,48 @@ class PPTBuilder:
             font.bold = bold
             font.italic = italic
 
-    def _fill_table(self, table, element: GeneratedElement | None) -> None:
+    def _fill_table(self, shape, rule: dict, element: GeneratedElement | None, layout_override: dict[str, object]) -> None:
+        self._set_shape_layout(shape, rule, layout_override)
+        table = shape.table
         all_rows = []
         if element is not None and element.headers:
             all_rows.append(element.headers)
         if element is not None and element.rows:
             all_rows.extend(element.rows)
+        row_heights = list(layout_override.get("row_heights") or self._estimate_table_row_heights(rule, element))
+        style = rule.get("style") or {}
+        header_style = self._resolve_table_text_style(style.get("header_style"), is_header=True)
+        body_style = self._resolve_table_text_style(style.get("body_style"), is_header=False)
         for row_index in range(len(table.rows)):
+            table.rows[row_index].height = row_heights[row_index] if row_index < len(row_heights) else 1
             for col_index in range(len(table.columns)):
                 value = ""
                 if row_index < len(all_rows) and col_index < len(all_rows[row_index]):
                     value = str(all_rows[row_index][col_index])
-                table.cell(row_index, col_index).text = value
+                cell = table.cell(row_index, col_index)
+                cell.text = value
+                cell_style = header_style if row_index == 0 and element is not None and element.headers else body_style
+                self._apply_table_cell_style(cell, cell_style)
 
-    def _place_image(self, slide: Slide, shape, rule: dict, element: GeneratedElement | None) -> None:
+    def _apply_table_cell_style(self, cell, style: dict[str, object]) -> None:
+        margins = style.get("margins") or {}
+        cell.margin_left = int(margins.get("left", 68580))
+        cell.margin_top = int(margins.get("top", 0))
+        cell.margin_right = int(margins.get("right", 68580))
+        cell.margin_bottom = int(margins.get("bottom", 0))
+        cell.vertical_anchor = self._to_vertical_anchor(style.get("vertical_anchor"))
+        text_frame = cell.text_frame
+        text_frame.word_wrap = True
+        paragraph = text_frame.paragraphs[0] if text_frame.paragraphs else text_frame.add_paragraph()
+        paragraph.alignment = self._to_paragraph_alignment(style.get("alignment"))
+        if paragraph.runs:
+            font = paragraph.runs[0].font
+            font.name = style.get("font_name") or "微软雅黑"
+            font.size = Pt((style.get("font_size") or 1400) / 100)
+            font.bold = bool(style.get("bold", False))
+            font.italic = bool(style.get("italic", False))
+
+    def _place_image(self, slide: Slide, shape, rule: dict, element: GeneratedElement | None, layout_override: dict[str, object]) -> None:
         if element is None or not element.rendered_path:
             if shape is not None:
                 self._remove_shape(shape)
@@ -277,11 +617,29 @@ class PPTBuilder:
         bbox = rule["bbox"]
         slide.shapes.add_picture(
             str(image_path),
-            left=int(bbox["x"]),
-            top=int(bbox["y"]),
-            width=int(bbox["w"]),
-            height=int(bbox["h"]),
+            left=int(layout_override.get("x", bbox["x"])),
+            top=int(layout_override.get("y", bbox["y"])),
+            width=int(layout_override.get("w", bbox["w"])),
+            height=int(layout_override.get("h", bbox["h"])),
         )
+
+    def _to_paragraph_alignment(self, alignment: str | None):
+        mapping = {
+            "left": PP_ALIGN.LEFT,
+            "center": PP_ALIGN.CENTER,
+            "right": PP_ALIGN.RIGHT,
+            "justify": PP_ALIGN.JUSTIFY,
+            "distribute": PP_ALIGN.DISTRIBUTE,
+        }
+        return mapping.get((alignment or "left").lower(), PP_ALIGN.LEFT)
+
+    def _to_vertical_anchor(self, anchor: str | None):
+        mapping = {
+            "top": MSO_ANCHOR.TOP,
+            "middle": MSO_ANCHOR.MIDDLE,
+            "bottom": MSO_ANCHOR.BOTTOM,
+        }
+        return mapping.get((anchor or "middle").lower(), MSO_ANCHOR.MIDDLE)
 
     def _remove_shape(self, shape) -> None:
         element = shape._element

@@ -69,4 +69,44 @@
 - `ppt-master` 的优势在于能把长文档快速组织成结构化 PPT，适合标准化交付。
 - 它的短板主要集中在可编辑性、图片一致性和生成成本上。
 - 综合判断：**建议将其作为公司内部标准化 PPT 的初稿生成工具使用，不建议作为高可编辑、高定制交付的唯一生成手段。**
+----
+# 
+## 
+```mermaid
+---
+config:
+  class:
+    hideEmptyMembersBox: true
+---
+classDiagram
+  direction LR
+  namespace 外部系统 {
+    class C_PES["C-PES"]
+    class P_OPTMS["PTMS-OPTMS"]
+    class OPTMS["OPTMS"]
+  }
+  namespace PTMS_IMS {
+    class 权限["权限管理模块"]
+    class 组合建账["组合建账模块"]
+    class 信息披露["信息披露模块<br/>(报告/报文)"]
+    class 数据安全["数据安全模块<br/>(水印)"]
+  }
+  C_PES --> 组合建账 : 推送企业年金计划组合
+  P_OPTMS --> 组合建账 : 推送职业年金计划组合
+  信息披露 --> OPTMS : 发送报文
+```
 
+
+
+
+----
+# dsf
+dss
+dsd
+sd
+ds
+d
+s
+
+s
+d
